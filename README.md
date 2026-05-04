@@ -1,3 +1,34 @@
+R-Control
+=========
+
+Aplicación móvil React Native para llevar un control diario de compras, ventas y gastos (SQLite).
+
+Rasgos principales:
+- Navegación por pestañas: Dashboard, Compras, Ventas, Gastos.
+- Ledger unificado en SQLite (materiales, compras, ventas, gastos).
+- Exportación JSON desde el Dashboard.
+
+Archivos importantes
+- `src/database/materials.ts` — Lógica de persistencia y recálculo de saldos.
+- `src/navigation/RootNavigator.tsx` — Navegación inferior.
+- `android/app/build/outputs/apk/release/app-release.apk` — APK release generado tras build.
+
+Construir y ejecutar (Android):
+
+```bash
+npm install
+cd android
+./gradlew assembleRelease
+# o para debug
+npx react-native run-android
+```
+
+Notas:
+- Antes de instalar una release firmada, haz backup de la base de datos SQLite si cambiás la firma del APK.
+- La exportación desde el Dashboard comparte un JSON que contiene materiales y movimientos por día.
+
+Contacto
+- Javier Rapalo
 This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
 
 # Getting Started

@@ -1,3 +1,21 @@
+node_modules/
+android/.gradle/
+android/app/build/
+ios/Pods/
+ios/build/
+*.keystore
+.env
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+/.vscode/
+*.iml
+build/
+*.log
+dist/
+*.apk
+android/app/build/outputs/
+package-lock.json
 # OSX
 #
 .DS_Store
