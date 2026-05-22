@@ -52,6 +52,19 @@ export type ExportPayload = {
   ledgers: DailyLedger[];
 };
 
+export type Client = {
+  id: string;
+  nombre: string;
+};
+
+export type MigrationResult = {
+  backupId: string;
+  backupJson: string;
+  migratedPurchases: number;
+  migratedTransactions: number;
+  alreadyMigrated: boolean;
+};
+
 type MaterialRow = {
   id: string;
   nombre: string;
@@ -100,12 +113,25 @@ type Database = {
   execute: (query: string, params?: Array<string | number>) => Promise<QueryResult>;
 };
 
+const slugify = (value: string): string =>
+  value
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+
 const DB_NAME = 'rcontrol.sqlite';
 const MATERIALS_TABLE = 'materials';
 const BALANCES_TABLE = 'daily_balances';
 const PURCHASES_TABLE = 'purchases';
 const SALES_TABLE = 'sales';
 const EXPENSES_TABLE = 'expenses';
+const CLIENTS_TABLE = 'clients';
+const PURCHASE_TRANSACTIONS_TABLE = 'purchase_transactions';
+const PURCHASE_ITEMS_TABLE = 'purchase_items';
+const MIGRATION_BACKUPS_TABLE = 'migration_backups';
 
 const DEFAULT_MATERIALS: Material[] = [
   { id: 'hierro', nombre: 'Hierro', precioPorLibra: 1.8 },
@@ -247,6 +273,55 @@ const ensureDatabase = async (): Promise<Database> => {
           monto REAL NOT NULL,
           created_at TEXT NOT NULL,
           FOREIGN KEY (business_date) REFERENCES ${BALANCES_TABLE} (business_date) ON DELETE CASCADE
+        )`,
+      );
+
+      await run(
+        database,
+        `CREATE TABLE IF NOT EXISTS ${CLIENTS_TABLE} (
+          id TEXT PRIMARY KEY NOT NULL,
+          nombre TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )`,
+      );
+
+      await run(
+        database,
+        `CREATE TABLE IF NOT EXISTS ${PURCHASE_TRANSACTIONS_TABLE} (
+          id TEXT PRIMARY KEY NOT NULL,
+          business_date TEXT NOT NULL,
+          client_id TEXT NOT NULL,
+          client_nombre TEXT NOT NULL,
+          total REAL NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY (business_date) REFERENCES ${BALANCES_TABLE} (business_date) ON DELETE CASCADE,
+          FOREIGN KEY (client_id) REFERENCES ${CLIENTS_TABLE} (id)
+        )`,
+      );
+
+      await run(
+        database,
+        `CREATE TABLE IF NOT EXISTS ${PURCHASE_ITEMS_TABLE} (
+          id TEXT PRIMARY KEY NOT NULL,
+          transaction_id TEXT NOT NULL,
+          material_id TEXT NOT NULL,
+          material_nombre TEXT NOT NULL,
+          precio_por_libra REAL NOT NULL,
+          libras REAL NOT NULL,
+          total REAL NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY (transaction_id) REFERENCES ${PURCHASE_TRANSACTIONS_TABLE} (id) ON DELETE CASCADE
+        )`,
+      );
+
+      await run(
+        database,
+        `CREATE TABLE IF NOT EXISTS ${MIGRATION_BACKUPS_TABLE} (
+          id TEXT PRIMARY KEY NOT NULL,
+          created_at TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          note TEXT
         )`,
       );
 
@@ -431,6 +506,45 @@ export const loadMaterials = async (): Promise<Material[]> => {
   return result.rows.map(row => fromMaterialRow(row));
 };
 
+export const loadClients = async (): Promise<Client[]> => {
+  const database = await ensureDatabase();
+  const result = await run(
+    database,
+    `SELECT id, nombre
+     FROM ${CLIENTS_TABLE}
+     ORDER BY nombre COLLATE NOCASE ASC`,
+  );
+
+  return result.rows.map(row => ({
+    id: String(row.id),
+    nombre: String(row.nombre),
+  }));
+};
+
+export const saveClient = async (input: { id?: string; nombre: string }): Promise<Client> => {
+  const nombre = input.nombre.trim();
+
+  if (!nombre) {
+    throw new Error('El nombre del cliente es obligatorio.');
+  }
+
+  const database = await ensureDatabase();
+  const id = input.id ?? (slugify(nombre) || createId());
+  const now = nowIso();
+
+  await run(
+    database,
+    `INSERT INTO ${CLIENTS_TABLE} (id, nombre, created_at, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       nombre = excluded.nombre,
+       updated_at = excluded.updated_at`,
+    [id, nombre, now, now],
+  );
+
+  return { id, nombre };
+};
+
 export const saveMaterial = async (input: {
   id?: string;
   nombre: string;
@@ -554,6 +668,133 @@ export const recordPurchase = async (
     `INSERT INTO ${PURCHASES_TABLE} (id, business_date, material_id, material_nombre, precio_por_libra, libras, total, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [createId(), businessDate, materialId, materialNombre, precioPorLibra, libras, total, now],
+  );
+
+  await recalculateBalance(database, businessDate);
+  return loadLedgerFromDatabase(database, businessDate);
+};
+
+export const recordClientPurchaseTransaction = async (
+  input: {
+    clientId?: string;
+    clientNombre: string;
+    items: Array<{
+      materialId: string;
+      materialNombre: string;
+      precioPorLibra: number;
+      libras: number;
+    }>;
+  },
+  businessDate: string = todayBusinessDate(),
+): Promise<DailyLedger> => {
+  const clientNombre = input.clientNombre.trim();
+  const items = input.items ?? [];
+
+  if (!clientNombre) {
+    throw new Error('El nombre del cliente es obligatorio.');
+  }
+
+  if (items.length === 0) {
+    throw new Error('Agrega al menos un material al carrito.');
+  }
+
+  const parsedItems = items.map(item => {
+    const materialId = item.materialId.trim();
+    const materialNombre = item.materialNombre.trim();
+    const precioPorLibra = Number(item.precioPorLibra);
+    const libras = Number(item.libras);
+
+    if (!materialId || !materialNombre) {
+      throw new Error('Todos los materiales del carrito deben ser válidos.');
+    }
+
+    if (!Number.isFinite(precioPorLibra) || precioPorLibra <= 0) {
+      throw new Error('El precio por libra de cada material debe ser mayor que 0.');
+    }
+
+    if (!Number.isFinite(libras) || libras <= 0) {
+      throw new Error('La cantidad de libras de cada material debe ser mayor que 0.');
+    }
+
+    return {
+      materialId,
+      materialNombre,
+      precioPorLibra,
+      libras,
+      total: precioPorLibra * libras,
+    };
+  });
+
+  const database = await ensureDatabase();
+  await ensureBalanceForDate(database, businessDate);
+
+  const now = nowIso();
+  const clientId = input.clientId?.trim() || slugify(clientNombre) || createId();
+  const transactionId = createId();
+
+  await run(
+    database,
+    `INSERT INTO ${CLIENTS_TABLE} (id, nombre, created_at, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       nombre = excluded.nombre,
+       updated_at = excluded.updated_at`,
+    [clientId, clientNombre, now, now],
+  );
+
+  await run(
+    database,
+    `INSERT INTO ${PURCHASE_TRANSACTIONS_TABLE} (id, business_date, client_id, client_nombre, total, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [transactionId, businessDate, clientId, clientNombre, 0, now],
+  );
+
+  let transactionTotal = 0;
+
+  for (const item of parsedItems) {
+    const purchaseId = createId();
+    const itemId = createId();
+    transactionTotal += item.total;
+
+    await run(
+      database,
+      `INSERT INTO ${PURCHASES_TABLE} (id, business_date, material_id, material_nombre, precio_por_libra, libras, total, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        purchaseId,
+        businessDate,
+        item.materialId,
+        item.materialNombre,
+        item.precioPorLibra,
+        item.libras,
+        item.total,
+        now,
+      ],
+    );
+
+    await run(
+      database,
+      `INSERT INTO ${PURCHASE_ITEMS_TABLE} (id, transaction_id, material_id, material_nombre, precio_por_libra, libras, total, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        itemId,
+        transactionId,
+        item.materialId,
+        item.materialNombre,
+        item.precioPorLibra,
+        item.libras,
+        item.total,
+        now,
+      ],
+    );
+  }
+
+  await run(
+    database,
+    `UPDATE ${PURCHASE_TRANSACTIONS_TABLE}
+     SET total = ?
+     WHERE id = ?`,
+    [transactionTotal, transactionId],
   );
 
   await recalculateBalance(database, businessDate);
@@ -704,5 +945,111 @@ export const loadExportPayload = async (): Promise<ExportPayload> => {
     exportedAt: nowIso(),
     materials,
     ledgers,
+  };
+};
+
+export const migrateLegacyPurchasesToClientModel = async (): Promise<MigrationResult> => {
+  const database = await ensureDatabase();
+  const payload = await loadExportPayload();
+  const backupId = `backup-${createId()}`;
+  const backupJson = JSON.stringify(payload, null, 2);
+  const migrationDate = nowIso();
+
+  await run(
+    database,
+    `INSERT INTO ${MIGRATION_BACKUPS_TABLE} (id, created_at, payload_json, note)
+     VALUES (?, ?, ?, ?)` ,
+    [backupId, migrationDate, backupJson, 'Backup automático antes de migración a compras por cliente'],
+  );
+
+  const existingItemsResult = await run(
+    database,
+    `SELECT COUNT(*) AS total FROM ${PURCHASE_ITEMS_TABLE}`,
+  );
+  const existingItemsTotal = Number(existingItemsResult.rows[0]?.total ?? 0);
+
+  if (existingItemsTotal > 0) {
+    return {
+      backupId,
+      backupJson,
+      migratedPurchases: 0,
+      migratedTransactions: 0,
+      alreadyMigrated: true,
+    };
+  }
+
+  const defaultClientId = 'cliente-general';
+  await run(
+    database,
+    `INSERT INTO ${CLIENTS_TABLE} (id, nombre, created_at, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       nombre = excluded.nombre,
+       updated_at = excluded.updated_at`,
+    [defaultClientId, 'Cliente general', migrationDate, migrationDate],
+  );
+
+  const legacyPurchasesResult = await run(
+    database,
+    `SELECT id, business_date, material_id, material_nombre, precio_por_libra, libras, total, created_at
+     FROM ${PURCHASES_TABLE}
+     ORDER BY created_at ASC`,
+  );
+
+  let migratedPurchases = 0;
+
+  for (const row of legacyPurchasesResult.rows) {
+    const legacy = row as Record<string, unknown>;
+    const transactionId = `legacy-${String(legacy.id)}`;
+    const createdAt = String(legacy.created_at);
+    const businessDate = String(legacy.business_date);
+    const total = Number(legacy.total ?? 0);
+
+    await run(
+      database,
+      `INSERT OR IGNORE INTO ${PURCHASE_TRANSACTIONS_TABLE} (
+        id,
+        business_date,
+        client_id,
+        client_nombre,
+        total,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)`,
+      [transactionId, businessDate, defaultClientId, 'Cliente general', total, createdAt],
+    );
+
+    await run(
+      database,
+      `INSERT OR IGNORE INTO ${PURCHASE_ITEMS_TABLE} (
+        id,
+        transaction_id,
+        material_id,
+        material_nombre,
+        precio_por_libra,
+        libras,
+        total,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        String(legacy.id),
+        transactionId,
+        String(legacy.material_id),
+        String(legacy.material_nombre),
+        Number(legacy.precio_por_libra ?? 0),
+        Number(legacy.libras ?? 0),
+        total,
+        createdAt,
+      ],
+    );
+
+    migratedPurchases += 1;
+  }
+
+  return {
+    backupId,
+    backupJson,
+    migratedPurchases,
+    migratedTransactions: migratedPurchases,
+    alreadyMigrated: false,
   };
 };

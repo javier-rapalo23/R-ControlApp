@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Alert, ScrollView, Share, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import Clipboard from '@react-native-clipboard/clipboard';
+import { Alert, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
 import BusinessDatePicker from '../components/BusinessDatePicker';
 import { loadBusinessDates, loadExportPayload, loadLedgerForDate, type DailyLedger } from '../database/index';
@@ -86,11 +87,10 @@ function DashboardScreen(): React.JSX.Element {
         totalSales: payload.ledgers.reduce((accumulated, ledger) => accumulated + ledger.sales.length, 0),
         totalExpenses: payload.ledgers.reduce((accumulated, ledger) => accumulated + ledger.expenses.length, 0),
       };
+      const exportText = `${JSON.stringify(summary, null, 2)}\n\n${JSON.stringify(payload, null, 2)}`;
 
-      await Share.share({
-        title: 'Exportación de RControl',
-        message: `${JSON.stringify(summary, null, 2)}\n\n${JSON.stringify(payload, null, 2)}`,
-      });
+      Clipboard.setString(exportText);
+      Alert.alert('Exportación lista', 'La información se copió al portapapeles para que la pegues donde necesites.');
     } catch (error) {
       const message = error instanceof Error ? error.message : 'No fue posible exportar la información.';
       Alert.alert('Error', message);
@@ -114,7 +114,7 @@ function DashboardScreen(): React.JSX.Element {
         <TouchableOpacity style={styles.secondaryButton} onPress={() => void exportData()} disabled={exporting}>
           <Text style={styles.secondaryButtonText}>{exporting ? 'Exportando...' : 'Exportar información'}</Text>
         </TouchableOpacity>
-        <Text style={styles.helperText}>Se comparte un JSON con materiales, días y movimientos.</Text>
+        <Text style={styles.helperText}>Se copia un JSON con materiales, días y movimientos al portapapeles.</Text>
       </View>
 
       <View style={styles.metricsGrid}>

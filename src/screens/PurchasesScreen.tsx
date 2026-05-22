@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import Clipboard from '@react-native-clipboard/clipboard';
 import {
   Alert,
   Modal,
@@ -16,11 +17,15 @@ import BusinessDatePicker from '../components/BusinessDatePicker';
 import {
   deletePurchase,
   loadBusinessDates,
+  loadClients,
   loadLedgerForDate,
   loadMaterials,
-  recordPurchase,
+  migrateLegacyPurchasesToClientModel,
+  recordClientPurchaseTransaction,
+  saveClient,
   saveInitialBalance,
   saveMaterial,
+  type Client,
   type Material,
   type Purchase,
 } from '../database/index';
@@ -33,6 +38,15 @@ const parseNumber = (value: string): number => {
 
 const formatMoney = (value: number): string => `L ${value.toFixed(2)}`;
 
+type CartItem = {
+  id: string;
+  materialId: string;
+  materialNombre: string;
+  precioPorLibra: number;
+  libras: number;
+  total: number;
+};
+
 function PurchasesScreen(): React.JSX.Element {
   const safeAreaInsets = useSafeAreaInsets();
   const today = new Date().toISOString().slice(0, 10);
@@ -42,9 +56,15 @@ function PurchasesScreen(): React.JSX.Element {
   const [saldoInicialText, setSaldoInicialText] = useState('');
   const [saldoInicialSaved, setSaldoInicialSaved] = useState(0);
   const [saldoActualSaved, setSaldoActualSaved] = useState(0);
+  const [clientes, setClientes] = useState<Client[]>([]);
+  const [clientSelectedId, setClientSelectedId] = useState('');
+  const [clientModalVisible, setClientModalVisible] = useState(false);
+  const [clientName, setClientName] = useState('');
+  const [savingClient, setSavingClient] = useState(false);
   const [materiales, setMateriales] = useState<Material[]>([]);
   const [materialSelectedId, setMaterialSelectedId] = useState('');
   const [librasText, setLibrasText] = useState('');
+  const [cartItems, setCartItems] = useState<CartItem[]>([]);
   const [compras, setCompras] = useState<Purchase[]>([]);
   const [materialModalVisible, setMaterialModalVisible] = useState(false);
   const [materialEditingId, setMaterialEditingId] = useState<string | null>(null);
@@ -55,19 +75,25 @@ function PurchasesScreen(): React.JSX.Element {
   const [registeringPurchase, setRegisteringPurchase] = useState(false);
   const [deletingPurchaseId, setDeletingPurchaseId] = useState<string | null>(null);
   const [savingMaterial, setSavingMaterial] = useState(false);
+  const [migratingData, setMigratingData] = useState(false);
 
   useEffect(() => {
     const loadStaticData = async (): Promise<void> => {
       try {
-        const [savedMaterials, businessDates] = await Promise.all([
+        const [savedMaterials, businessDates, savedClients] = await Promise.all([
           loadMaterials(),
           loadBusinessDates(),
+          loadClients(),
         ]);
 
         setMateriales(savedMaterials);
+        setClientes(savedClients);
         setAvailableBusinessDates([selectedBusinessDate, ...businessDates].filter(Boolean));
         if (savedMaterials.length > 0) {
           setMaterialSelectedId(prev => prev || savedMaterials[0].id);
+        }
+        if (savedClients.length > 0) {
+          setClientSelectedId(prev => prev || savedClients[0].id);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : 'No fue posible cargar los materiales.';
@@ -101,15 +127,20 @@ function PurchasesScreen(): React.JSX.Element {
 
   const materialSelected =
     materiales.find(material => material.id === materialSelectedId) ?? materiales[0] ?? null;
+  const clientSelected = clientes.find(client => client.id === clientSelectedId) ?? clientes[0] ?? null;
 
   const saldoInicial = parseNumber(saldoInicialText);
   const libras = parseNumber(librasText);
   const totalPurchaseNow = materialSelected ? libras * materialSelected.precioPorLibra : 0;
+  const totalCart = useMemo(
+    () => cartItems.reduce((accumulated, item) => accumulated + item.total, 0),
+    [cartItems],
+  );
   const totalPurchases = useMemo(
     () => compras.reduce((accumulated, purchase) => accumulated + purchase.total, 0),
     [compras],
   );
-  const projectedBalance = saldoActualSaved - totalPurchaseNow;
+  const projectedBalance = saldoActualSaved - (totalCart + totalPurchaseNow);
 
   const saveInitialBalanceHandler = async (): Promise<void> => {
     if (!Number.isFinite(saldoInicial) || saldoInicial < 0) {
@@ -154,6 +185,41 @@ function PurchasesScreen(): React.JSX.Element {
     }
   };
 
+  const openNewClient = (): void => {
+    setClientName('');
+    setClientModalVisible(true);
+  };
+
+  const closeClientModal = (): void => {
+    if (!savingClient) {
+      setClientModalVisible(false);
+    }
+  };
+
+  const saveClientHandler = async (): Promise<void> => {
+    const name = clientName.trim();
+
+    if (!name) {
+      Alert.alert('Dato inválido', 'Ingresa el nombre del cliente.');
+      return;
+    }
+
+    setSavingClient(true);
+
+    try {
+      const createdClient = await saveClient({ nombre: name });
+      const updatedClients = await loadClients();
+      setClientes(updatedClients);
+      setClientSelectedId(createdClient.id);
+      setClientModalVisible(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'No fue posible guardar el cliente.';
+      Alert.alert('Error', message);
+    } finally {
+      setSavingClient(false);
+    }
+  };
+
   const saveMaterialHandler = async (): Promise<void> => {
     const name = materialName.trim();
     const price = parseNumber(materialPriceText);
@@ -193,7 +259,7 @@ function PurchasesScreen(): React.JSX.Element {
     }
   };
 
-  const registerPurchaseHandler = (): void => {
+  const addToCartHandler = (): void => {
     if (!materialSelected) {
       Alert.alert('Sin materiales', 'Agrega al menos un material primero.');
       return;
@@ -204,16 +270,48 @@ function PurchasesScreen(): React.JSX.Element {
       return;
     }
 
+    const nextItem: CartItem = {
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      materialId: materialSelected.id,
+      materialNombre: materialSelected.nombre,
+      precioPorLibra: materialSelected.precioPorLibra,
+      libras,
+      total: totalPurchaseNow,
+    };
+
+    setCartItems(prev => [...prev, nextItem]);
+    setLibrasText('');
+  };
+
+  const removeCartItemHandler = (itemId: string): void => {
+    setCartItems(prev => prev.filter(item => item.id !== itemId));
+  };
+
+  const registerPurchaseHandler = (): void => {
+    if (!clientSelected) {
+      Alert.alert('Sin cliente', 'Selecciona o crea un cliente para registrar la compra.');
+      return;
+    }
+
+    if (cartItems.length === 0) {
+      Alert.alert('Carrito vacío', 'Agrega al menos un material al carrito.');
+      return;
+    }
+
     setRegisteringPurchase(true);
 
     void (async () => {
       try {
-        const ledger = await recordPurchase(
+        const ledger = await recordClientPurchaseTransaction(
           {
-            materialId: materialSelected.id,
-            materialNombre: materialSelected.nombre,
-            precioPorLibra: materialSelected.precioPorLibra,
-            libras,
+            clientId: clientSelected.id,
+            clientNombre: clientSelected.nombre,
+            items: cartItems.map(item => ({
+              materialId: item.materialId,
+              materialNombre: item.materialNombre,
+              precioPorLibra: item.precioPorLibra,
+              libras: item.libras,
+            })),
           },
           selectedBusinessDate,
         );
@@ -221,7 +319,7 @@ function PurchasesScreen(): React.JSX.Element {
         setAvailableBusinessDates(prev => [...new Set([selectedBusinessDate, ...prev])]);
         setSaldoActualSaved(ledger.saldoActual);
         setCompras(ledger.purchases);
-        setLibrasText('');
+        setCartItems([]);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'No fue posible registrar la compra.';
         Alert.alert('Error', message);
@@ -247,6 +345,44 @@ function PurchasesScreen(): React.JSX.Element {
     } finally {
       setDeletingPurchaseId(null);
     }
+  };
+
+  const runMigrationHandler = async (): Promise<void> => {
+    setMigratingData(true);
+
+    try {
+      const result = await migrateLegacyPurchasesToClientModel();
+      Clipboard.setString(result.backupJson);
+
+      Alert.alert(
+        'Migración completada',
+        result.alreadyMigrated
+          ? `Ya existía una migración previa.\nBackup: ${result.backupId}\nJSON copiado al portapapeles.`
+          : `Backup generado: ${result.backupId}\nCompras migradas: ${result.migratedPurchases}\nJSON copiado al portapapeles.`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'No fue posible ejecutar la migración.';
+      Alert.alert('Error', message);
+    } finally {
+      setMigratingData(false);
+    }
+  };
+
+  const confirmMigrationHandler = (): void => {
+    Alert.alert(
+      'Migrar compras por cliente',
+      'Primero se creará un backup JSON automático y luego se convertirán las compras antiguas al nuevo formato por cliente. ¿Deseas continuar?',
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Migrar',
+          style: 'destructive',
+          onPress: () => {
+            void runMigrationHandler();
+          },
+        },
+      ],
+    );
   };
 
   return (
@@ -285,6 +421,43 @@ function PurchasesScreen(): React.JSX.Element {
         </View>
 
         <View style={styles.card}>
+          <View style={styles.rowBetween}>
+            <Text style={styles.sectionTitle}>Cliente</Text>
+            <TouchableOpacity style={styles.secondaryButton} onPress={openNewClient}>
+              <Text style={styles.secondaryButtonText}>+ Nuevo cliente</Text>
+            </TouchableOpacity>
+          </View>
+
+          {clientes.length === 0 ? (
+            <Text style={styles.empty}>Todavía no hay clientes guardados.</Text>
+          ) : (
+            <View style={styles.materialGrid}>
+              {clientes.map(client => {
+                const active = client.id === clientSelectedId;
+
+                return (
+                  <TouchableOpacity
+                    key={client.id}
+                    style={[styles.materialCard, active && styles.materialCardActive]}
+                    onPress={() => setClientSelectedId(client.id)}>
+                    <View style={styles.materialTap}>
+                      <Text style={[styles.materialName, active && styles.onPrimary]}>{client.nombre}</Text>
+                    </View>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          )}
+
+          <View style={styles.materialSelectedBox}>
+            <Text style={styles.materialSelectedLabel}>Cliente seleccionado</Text>
+            <Text style={styles.materialSelectedValue}>
+              {clientSelected ? clientSelected.nombre : 'No hay cliente seleccionado'}
+            </Text>
+          </View>
+
+          <View style={styles.separator} />
+
           <View style={styles.rowBetween}>
             <Text style={styles.sectionTitle}>Materiales</Text>
             <TouchableOpacity style={styles.secondaryButton} onPress={openNewMaterial}>
@@ -337,14 +510,56 @@ function PurchasesScreen(): React.JSX.Element {
 
           <Text style={styles.summary}>Total compra: {formatMoney(totalPurchaseNow)}</Text>
 
+          <TouchableOpacity style={styles.secondaryButton} onPress={addToCartHandler}>
+            <Text style={styles.secondaryButtonText}>Agregar al carrito</Text>
+          </TouchableOpacity>
+
+          <Text style={styles.sectionTitle}>Carrito</Text>
+          <Text style={styles.summary}>Total carrito: {formatMoney(totalCart)}</Text>
+
+          {cartItems.length === 0 ? (
+            <Text style={styles.empty}>Aún no hay productos en el carrito.</Text>
+          ) : (
+            cartItems.map(item => (
+              <View key={item.id} style={styles.purchaseRow}>
+                <View style={styles.purchaseInfo}>
+                  <Text style={styles.purchaseTitle}>
+                    {item.materialNombre} - {item.libras} lb
+                  </Text>
+                  <Text style={styles.purchaseSubtitle}>{formatMoney(item.precioPorLibra)}/lb</Text>
+                </View>
+                <View style={styles.purchaseActions}>
+                  <Text style={styles.purchaseTotal}>{formatMoney(item.total)}</Text>
+                  <TouchableOpacity
+                    style={styles.deleteButton}
+                    onPress={() => removeCartItemHandler(item.id)}>
+                    <Text style={styles.deleteButtonText}>Quitar</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ))
+          )}
+
           <TouchableOpacity style={styles.primaryButton} onPress={registerPurchaseHandler} disabled={registeringPurchase}>
-            <Text style={styles.primaryButtonText}>{registeringPurchase ? 'Registrando...' : 'Registrar compra'}</Text>
+            <Text style={styles.primaryButtonText}>
+              {registeringPurchase ? 'Registrando...' : 'Registrar compra del cliente'}
+            </Text>
           </TouchableOpacity>
         </View>
 
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Compras del día {selectedBusinessDate}</Text>
           <Text style={styles.summary}>Total comprado: {formatMoney(totalPurchases)}</Text>
+
+          <TouchableOpacity
+            style={styles.secondaryButton}
+            onPress={confirmMigrationHandler}
+            disabled={migratingData}>
+            <Text style={styles.secondaryButtonText}>
+              {migratingData ? 'Migrando...' : 'Migrar compras antiguas por cliente'}
+            </Text>
+          </TouchableOpacity>
+          <Text style={styles.summarySecondary}>Esta acción genera backup JSON automático antes de migrar.</Text>
 
           {compras.length === 0 ? (
             <Text style={styles.empty}>Aún no hay compras registradas.</Text>
@@ -413,6 +628,35 @@ function PurchasesScreen(): React.JSX.Element {
           </View>
         </View>
       </Modal>
+
+      <Modal
+        transparent
+        visible={clientModalVisible}
+        animationType="fade"
+        onRequestClose={closeClientModal}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Nuevo cliente</Text>
+
+            <Text style={styles.label}>Nombre del cliente</Text>
+            <TextInput
+              style={styles.input}
+              value={clientName}
+              onChangeText={setClientName}
+              placeholder="Ej: Cliente de mercado"
+            />
+
+            <View style={styles.modalActions}>
+              <TouchableOpacity style={styles.cancelButton} onPress={closeClientModal}>
+                <Text style={styles.cancelButtonText}>Cancelar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.primaryButton} onPress={saveClientHandler} disabled={savingClient}>
+                <Text style={styles.primaryButtonText}>{savingClient ? 'Guardando...' : 'Guardar'}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -457,6 +701,12 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     gap: 12,
+  },
+  separator: {
+    borderTopWidth: 1,
+    borderTopColor: '#E2E8F0',
+    marginTop: 2,
+    paddingTop: 8,
   },
   input: {
     borderWidth: 1,

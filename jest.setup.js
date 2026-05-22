@@ -28,6 +28,11 @@ jest.mock('react-native-screens', () => ({
 
 jest.mock('react-native-vector-icons/Ionicons', () => 'Ionicons');
 
+jest.mock('@react-native-clipboard/clipboard', () => ({
+  setString: jest.fn(),
+  getString: jest.fn(() => Promise.resolve('')),
+}));
+
 const defaultMaterials = [
   { id: 'hierro', nombre: 'Hierro', precio_por_libra: 1.8 },
   { id: 'aluminio', nombre: 'Aluminio', precio_por_libra: 6.5 },
